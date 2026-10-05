@@ -50,16 +50,11 @@ __device__ __forceinline__ void cp_async_wait_group_0() {
 }
 
 // ldmatrix: cooperative shared-memory -> register load of 8x8 b16 matrices.
-// x4 = four matrices (full 16x16 A fragment), x2 = two matrices (8x16 B fragment)
+// x4 = four matrices (full 16x16 A fragment)
 __device__ __forceinline__ void ldmatrix_x4(unsigned &r0, unsigned &r1, unsigned &r2, unsigned &r3,unsigned addr) 
 {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
-}
-
-// mma.sync m16n8k16: D += A * B, bf16 inputs, f32 accumulate (C/D are f32)
-__device__ __forceinline__ void ldmatrix_x2(unsigned &r0, unsigned &r1, unsigned addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(addr));
 }
 
 __device__ __forceinline__ void mma_bf16_f32(float *d, const unsigned *a, const unsigned *b) {
@@ -113,22 +108,21 @@ __global__ void mult_kernel(
     // The "long" axis (larger grid dimension) is the one being grouped.
     int pid = blockIdx.x;
     int pid_m, pid_n;
-
-    bool n_major = (grid_n > grid_m);		// group along the larger axis
-    int g_long  = n_major ? grid_n : grid_m;    // tiles along the grouped axis
-    int g_short = n_major ? grid_m : grid_n;	// tiles along the other axis
-
-    int num_pid_in_group = GROUP * g_short;
-    int group_id    = pid / num_pid_in_group;
-    int first_pid   = group_id * GROUP;
-    int group_size  = min(g_long - first_pid, GROUP);   // handle the last partial group
-
-    int p_long  = first_pid + (pid % num_pid_in_group) % group_size;
-    int p_short = (pid % num_pid_in_group) / group_size;
-
-    pid_m = n_major ? p_short : p_long;
-    pid_n = n_major ? p_long  : p_short;
-
+    if (along_m) {
+        const int num_pid_in_group = GROUP * grid_n;
+        const int group_id  = pid / num_pid_in_group;
+        const int first_pid = group_id * GROUP;
+        const int group_size = min(grid_m - first_pid, GROUP);   // 处理尾巴组
+        pid_m = first_pid + (pid % num_pid_in_group) % group_size;
+        pid_n = (pid % num_pid_in_group) / group_size;
+    } else {
+        const int num_pid_in_group = GROUP * grid_m;
+        const int group_id  = pid / num_pid_in_group;
+        const int first_pid = group_id * GROUP;
+        const int group_size = min(grid_n - first_pid, GROUP);
+        pid_n = first_pid + (pid % num_pid_in_group) % group_size;
+        pid_m = (pid % num_pid_in_group) / group_size;
+    }
     const int global_m_start = pid_m * BM;
     const int global_n_start = pid_n * BN;
 
@@ -247,7 +241,6 @@ __global__ void mult_kernel(
         {
             int rB = tid / CHUNKS;
             const int cB = tid % CHUNKS;    
-            //constexpr int rB_step = THREADS_PER_BLOCK >> 3;
             unsigned dst = smem_u32addr(B_value[buf] + rB * BK_STRIDE + cB * BF16_BATCH);
             constexpr unsigned dst_step = ROWS_PER_PASS * BK_STRIDE * sizeof(__nv_bfloat16);
 #pragma unroll
@@ -284,7 +277,7 @@ __global__ void mult_kernel(
     // shared-memory latency behind Tensor Core work.
     auto compute_tile = [&](int buf) {
         unsigned a_buf[2][PM][4];	// double-buffered A fragments (4 regs each)
-        unsigned b_buf[2][PN][2];	// double-buffered B fragments (2 regs each)
+        unsigned b_buf[2][PN/2][2];	// double-buffered B fragments (2 regs each)
         auto load_frag = [&](int b, int ko) {
             const unsigned koff = ko * KO_OFF;
 #pragma unroll
@@ -293,8 +286,9 @@ __global__ void mult_kernel(
                             a_buf[b][mi][2], a_buf[b][mi][3], a_addr[buf][mi] + koff);
 
 #pragma unroll
-            for (int ni = 0; ni < PN; ++ni)
-                ldmatrix_x2(b_buf[b][ni][0], b_buf[b][ni][1], b_addr[buf][ni] + koff);
+            for (int ni = 0; ni < PN/2; ++ni)
+                ldmatrix_x2(b_buf[b][ni][0], b_buf[b][ni][1], 
+		b_buf[b][ni][2], b_buf[b][ni][3],b_addr[buf][ni] + koff);
         };
 
         load_frag(0, 0);	// prime the pipeline
@@ -304,20 +298,30 @@ __global__ void mult_kernel(
         {
             load_frag((ko & 1) ^ 1, ko + 1);	 // prefetch next fragment
 #pragma unroll
-            for (int ni = 0; ni < PN; ++ni)
+            for (int ni = 0; ni < PN/2; ++ni)
 #pragma unroll
                 for (int mi = 0; mi < PM; ++mi)
-                    mma_bf16_f32(acc[mi][ni], a_buf[ko & 1][mi], b_buf[ko & 1][ni]);
+		{
+			// {r0,r1}
+			// {r2,r3}
+                    mma_bf16_f32(acc[mi][2*ni],a_buf[ko&1][mi], &b_buf[ko&1][ni][0]); 
+                    mma_bf16_f32(acc[mi][2*ni+1], a_buf[ko&1][mi], &b_buf[ko&1][ni][2]); 
+		}
         }
 
         // Drain the last MMA step
         constexpr int ko = BK / MMA_K - 1;
 #pragma unroll
 
-        for (int ni = 0; ni < PN; ++ni)
+        for (int ni = 0; ni < PN/2; ++ni)
 #pragma unroll
             for (int mi = 0; mi < PM; ++mi)
-                mma_bf16_f32(acc[mi][ni], a_buf[ko & 1][mi], b_buf[ko & 1][ni]);
+                {
+			// {r0,r1}
+			// {r2,r3}
+                    mma_bf16_f32(acc[mi][2*ni],a_buf[ko&1][mi], &b_buf[ko&1][ni][0]); 
+                    mma_bf16_f32(acc[mi][2*ni+1], a_buf[ko&1][mi], &b_buf[ko&1][ni][2]); 
+		}
     };
 
     const int num_k_tiles = (int)((K + BK - 1) / BK);
@@ -377,7 +381,8 @@ __global__ void mult_kernel(
                     __floats2bfloat162_rn(acc[mi][ni][2], acc[mi][ni][3]);
             }
         }
-    } else {
+    } 
+    else {
         // Boundary path: element-wise guards, semantically identical to a naive
         // per-element bounds-checked version
 #pragma unroll
@@ -430,26 +435,91 @@ void launch(const __nv_bfloat16 *A, const __nv_bfloat16 *B, __nv_bfloat16 *C,
         attr_set = true;
     }
 
-    const int grid_m = (int)((M + BM - 1) / BM);
-    const int grid_n = (int)((N + BN - 1) / BN);
+    // ---------------------------------------------------------------------------
+    // Group-swizzle heuristic: choose the persistent-tile grouping factor GROUP
+    // and the resident direction (along M or along N) that minimizes the total
+    // DRAM traffic of the GEMM kernel, subject to the L2 capacity budget.
+    //
+    // Cost model:
+    //   - The resident-side matrix (A if along M, else B) is read exactly once.
+    //   - The streaming-side matrix is re-read once per group
+    //     (i.e., ceil(num_resident_tiles / GROUP) times).
+    //   - The L2 footprint of a group must fit: resident strip + concurrent
+    //     streaming tiles (bounded by warp count) + output C tile + margin.
+    // ---------------------------------------------------------------------------
 
-    int GROUP_M = std::min(8, grid_m);
+    const int grid_m = (int)((M + BM - 1) / BM);   // tiles along M dimension
+    const int grid_n = (int)((N + BN - 1) / BN);   // tiles along N dimension
 
-    mult_kernel<BM, BN, BK, PM, PN> <<< grid_m *grid_n, THREADS_PER_BLOCK, smem_bytes>>>(
-        A, B, C, M, N, K, grid_m, grid_n, GROUP_M);
+    const size_t tile_A_bytes = (size_t)BM * K * sizeof(__nv_bfloat16);    // bytes of one A-tile strip (fp16)
+    const size_t tile_B_bytes = (size_t)BN * K * sizeof(__nv_bfloat16);     // bytes of one B-tile strip (fp16)
+    const int total_warps = SM_NUM * (BLOCK_WARPS/SM_SUBCORES);                    // persistent warps launched per SM * SM count
+    const size_t tile_C_bytes = (size_t)total_warps * BM * BN * 2; // bytes of one output C tile (fp16)
+    const size_t l2_cache_bytes = 40u << 20;         // measured via cudaDeviceGetAttribute
+    const size_t l2_safety_margin = 1u << 20;          // extra headroom for synchronization drift
+
+    int     best_group    = 1;            // chosen grouping factor (tiles per group)
+    bool    resident_along_m = true;      // true: A stays resident (group along M)
+    double  best_cost     = 1e30;         // best estimated DRAM traffic in bytes
+
+    for (int direction = 0; direction < 2; ++direction)
+    {
+        const bool is_along_m = (direction == 0);            // along M: A resident, B streams
+        const int  resident_tiles = is_along_m ? grid_m : grid_n;  // tiles along resident axis (upper bound for group size)
+        const int  streaming_tiles = is_along_m ? grid_n : grid_m; // tiles along streaming axis
+        const size_t resident_tile_bytes = is_along_m ? tile_A_bytes : tile_B_bytes; // per-tile traffic on resident side
+        const size_t stream_tile_bytes = is_along_m ? tile_B_bytes : tile_A_bytes; // per-tile traffic on streaming side
+        const double resident_matrix_bytes = (double)(is_along_m ? M : N) * K * 2;   // resident matrix: read once in total
+        const double stream_matrix_bytes = (double)(is_along_m ? N : M) * K * 2;   // streaming matrix: re-read once per group
+
+        for (int group_size = 1; group_size <= resident_tiles; ++group_size)
+        {
+            // Streaming-axis concurrency width: how many tiles the warp pool
+            // can cover simultaneously (auto-scales with group size).
+            const int concurrent_stream_tiles = min(streaming_tiles,
+                                                    (total_warps + group_size - 1) / group_size);
+
+            // Estimated L2 working-set footprint for one group:
+            //   resident strip (bounded by actual resident tile count)
+            // + concurrent streaming tiles (their LRU reuse distance)
+            // + output C tile writeback
+            // + safety margin
+            const size_t l2_footprint = (size_t)min(resident_tiles, group_size) * resident_tile_bytes
+                        + (size_t)concurrent_stream_tiles * stream_tile_bytes
+                        + tile_C_bytes
+                        + l2_safety_margin;
+
+            if (l2_footprint > l2_cache_bytes)
+                continue;               // over budget: residency would evict, skip
+
+            // Total DRAM traffic estimate:
+            // resident matrix read once + streaming matrix re-read per group.
+            const double traffic_cost = resident_matrix_bytes
+                        + stream_matrix_bytes * ((resident_tiles + group_size - 1) / group_size);
+
+            // Accept if strictly cheaper; on a tie prefer the larger group size,
+            // since a wider resident strip behaves more stably in L2.
+            if (traffic_cost < best_cost - 1e-9
+                || (traffic_cost < best_cost + 1e-9 && group_size > best_group))
+            {
+                best_cost = traffic_cost;
+                best_group  = group_size;
+                resident_along_m = is_along_m;
+            }
+        }
+    }
+
+    mult_kernel<BM, BN, BK, PM, PN><<< grid_m *grid_n, THREADS_PER_BLOCK, smem_bytes>>>(
+        A, B, C, M, N, K, grid_m, grid_n,best_group,resident_along_m);
 }
 
 // Host entry: picks a tile configuration based on the aspect ratio M/N.
-// Tall-skinny (M >> N): use wide-B tiles / more N-fragments per warp to keep
-// the B-tile residency high; the symmetric case for wide matrices.
 void run_kernel(
     const __nv_bfloat16 *A, const __nv_bfloat16 *B, __nv_bfloat16 *C,
     int64_t M, int64_t N, int64_t K) {
     float k = (float)M/(float)N;
-    if (k>=8.f)          
-        launch<256, 128, 64, 8, 4>(A, B, C, M, N, K);
-    else if (k<4.f && k<=0.5f)       
-        launch<128, 256, 64, 8, 4>(A, B, C, M, N, K);
-    else                      
-        launch<256, 128, 64, 4, 8>(A, B, C, M, N, K);
+    if(k >=1.f )
+        launch<256,128,64,4,8>(A, B, C, M, N, K);
+    else 
+        launch<128,256,64,4,8>(A, B, C, M, N, K);
 }
